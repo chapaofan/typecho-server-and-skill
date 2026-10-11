@@ -170,31 +170,37 @@ def _dec_count(conn, mid: int) -> None:
 
 # ---------- 公共 API ----------
 
-def set_post_categories(cid: int, category_mids: Sequence[int]) -> List[int]:
-    with get_conn() as conn:
-        _set_categories(conn, cid, category_mids, recount=True)
+def set_post_categories(cid: int, category_mids: Sequence[int], conn=None) -> List[int]:
+    """
+    重建 cid 的分类关联。
+
+    conn 传入时复用调用方的事务（新增/编辑文章时应传，避免一个请求开好几个
+    连接、也避免分类写进去了文章却回滚）。
+    """
+    with get_conn(conn) as c:
+        _set_categories(c, cid, category_mids, recount=True)
         return list(category_mids)
 
 
-def set_post_tags(cid: int, tag_names: Sequence[str]) -> List[int]:
-    with get_conn() as conn:
-        return _set_tags(conn, cid, tag_names, recount=True)
+def set_post_tags(cid: int, tag_names: Sequence[str], conn=None) -> List[int]:
+    with get_conn(conn) as c:
+        return _set_tags(c, cid, tag_names, recount=True)
 
 
-def get_post_categories(cid: int) -> List[Dict[str, Any]]:
-    with get_conn() as conn:
+def get_post_categories(cid: int, conn=None) -> List[Dict[str, Any]]:
+    with get_conn(conn) as c:
         return select_all(
-            conn, "metas",
+            c, "metas",
             "type='category' AND mid IN (SELECT mid FROM %s WHERE cid=%%s)" %
             CONFIG.typecho.table("relationships"),
             (cid,),
         )
 
 
-def get_post_tags(cid: int) -> List[Dict[str, Any]]:
-    with get_conn() as conn:
+def get_post_tags(cid: int, conn=None) -> List[Dict[str, Any]]:
+    with get_conn(conn) as c:
         return select_all(
-            conn, "metas",
+            c, "metas",
             "type='tag' AND mid IN (SELECT mid FROM %s WHERE cid=%%s)" %
             CONFIG.typecho.table("relationships"),
             (cid,),

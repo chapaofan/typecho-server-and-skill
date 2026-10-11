@@ -5,11 +5,19 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# 项目根（src/typecho_agent_api/config.py 往上两级）
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# 显式指定 .env 路径。
+# 不能依赖 load_dotenv() 默认的向上查找：gunicorn / supervisor / 宝塔 启动时
+# 的工作目录不确定，一旦找错文件，API_KEYS 和数据库密码会是空值，
+# 表现为「服务还在跑但所有接口 503」，很难排查。
+load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 
 def _get(name: str, default: str = "") -> str:
@@ -20,6 +28,13 @@ def _get(name: str, default: str = "") -> str:
 def _get_int(name: str, default: int) -> int:
     try:
         return int(_get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _get_float(name: str, default: float) -> float:
+    try:
+        return float(_get(name, str(default)))
     except ValueError:
         return default
 
@@ -42,6 +57,17 @@ class TypechoConfig:
     table_prefix: str = "typecho_"
     default_author_id: int = 1
     default_category_id: int = 1
+    # 连接/读写超时（秒）。不设的话 MySQL 或网络一卡住，工作线程会永久挂起，
+    # 线程耗尽后整个服务「假死」（进程还在，但不再响应任何请求）。
+    connect_timeout: int = 5
+    read_timeout: int = 15
+    write_timeout: int = 15
+    # 连接池上限。Flask/gunicorn 每个 worker 一份池，注意 上限 * worker数 * 进程数
+    # 不能超过 MySQL 的 max_connections。
+    pool_max_connections: int = 10
+    # 池满时最多等多久（秒）。DBUtils 的 blocking=True 是**无限等待**，
+    # 一旦有连接泄漏就会把整个服务拖成无响应，所以这里自己实现带超时的等待。
+    pool_wait_timeout: float = 5.0
 
     def table(self, name: str) -> str:
         """返回带前缀的表名，例如 table('contents') -> 'typecho_contents'。"""
@@ -57,6 +83,8 @@ class CosConfig:
     scheme: str = "https"
     key_prefix: str = "blog/"
     cdn_domain: str = ""
+    # COS HTTP 超时（秒）。SDK 不设就是无超时，网络抖动时会把线程永久卡住。
+    timeout: int = 20
 
 
 @dataclass
@@ -69,6 +97,9 @@ class AppConfig:
     # 服务端是否允许 upload_image_from_file 从服务端文件系统读文件上传。
     # 默认 false：产线应该用 upload_image_from_base64；本地开发时改为 true。
     allow_local_upload: bool = False
+    # 单个请求体 / 单张上传图片的最大字节数。不做限制的话一个几十 MB 的请求
+    # 就能把内存打满（Flask 默认不限制请求体大小）。
+    max_upload_bytes: int = 20 * 1024 * 1024
     typecho: TypechoConfig = field(default_factory=TypechoConfig)
     cos: CosConfig = field(default_factory=CosConfig)
 
@@ -81,6 +112,7 @@ def load_config() -> AppConfig:
         http_port=_get_int("HTTP_PORT", 8000),
         http_debug=_get("HTTP_DEBUG", "false").lower() in ("1", "true", "yes"),
         allow_local_upload=_get("ALLOW_LOCAL_UPLOAD", "false").lower() in ("1", "true", "yes"),
+        max_upload_bytes=_get_int("MAX_UPLOAD_MB", 20) * 1024 * 1024,
         typecho=TypechoConfig(
             host=_get("TYPECHO_DB_HOST", "localhost"),
             port=_get_int("TYPECHO_DB_PORT", 3306),
@@ -91,6 +123,11 @@ def load_config() -> AppConfig:
             table_prefix=_get("TYPECHO_TABLE_PREFIX", "typecho_"),
             default_author_id=_get_int("TYPECHO_DEFAULT_AUTHOR_ID", 1),
             default_category_id=_get_int("TYPECHO_DEFAULT_CATEGORY_ID", 1),
+            connect_timeout=_get_int("TYPECHO_DB_CONNECT_TIMEOUT", 5),
+            read_timeout=_get_int("TYPECHO_DB_READ_TIMEOUT", 15),
+            write_timeout=_get_int("TYPECHO_DB_WRITE_TIMEOUT", 15),
+            pool_max_connections=_get_int("TYPECHO_DB_POOL_MAX", 10),
+            pool_wait_timeout=_get_float("TYPECHO_DB_POOL_WAIT_TIMEOUT", 5.0),
         ),
         cos=CosConfig(
             secret_id=_get("COS_SECRET_ID"),
@@ -100,6 +137,7 @@ def load_config() -> AppConfig:
             scheme=_get("COS_SCHEME", "https"),
             key_prefix=_get("COS_KEY_PREFIX", "blog/"),
             cdn_domain=_get("COS_CDN_DOMAIN"),
+            timeout=_get_int("COS_TIMEOUT", 20),
         ),
     )
 

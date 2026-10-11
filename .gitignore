@@ -55,3 +55,6 @@ logs/
 
 # Typecho agent api 特有
 .uvicorn.pid
+
+# WorkBuddy 本地记忆（不进仓库）
+.workbuddy/

@@ -15,6 +15,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, request
+from werkzeug.exceptions import HTTPException
 
 from .agent_tools import ToolDispatcher
 from .auth import is_valid_key
@@ -38,6 +39,9 @@ logging.basicConfig(
 )
 
 app = Flask(__name__)
+# 请求体上限。Flask 默认不限制，一个几十 MB 的 body 就能把内存吃光，
+# 而这类请求往往是「服务突然挂了」的直接原因。
+app.config["MAX_CONTENT_LENGTH"] = CONFIG.max_upload_bytes
 dispatcher = ToolDispatcher()
 
 
@@ -178,31 +182,53 @@ def api_upload_image():
     if not f:
         return jsonify({"ok": False, "error": "no file"}), 400
     data = f.read()
-    return jsonify(upload_base64(
-        b64=base64.b64encode(data).decode(),
-        filename=f.filename or "image.png",
-        content_type=f.content_type,
-    ))
+    try:
+        return jsonify(upload_base64(
+            b64=base64.b64encode(data).decode(),
+            filename=f.filename or "image.png",
+            content_type=f.content_type,
+        ))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 
 @app.route("/v1/images/upload_base64", methods=["POST"])
 def api_upload_image_base64():
     body = request.get_json(force=True, silent=True) or {}
-    return jsonify(upload_base64(
-        b64=body.get("base64_data", ""),
-        filename=body.get("filename", "image.png"),
-    ))
+    try:
+        return jsonify(upload_base64(
+            b64=body.get("base64_data", ""),
+            filename=body.get("filename", "image.png"),
+        ))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 
 @app.route("/v1/images/<path:key>", methods=["DELETE"])
 def api_delete_image(key: str):
-    ok = cos_delete(key)
+    try:
+        ok = cos_delete(key)
+    except ValueError as e:
+        # 例如 key 不在 COS_KEY_PREFIX 下，拒绝删除
+        return jsonify({"ok": False, "error": str(e)}), 400
     return jsonify({"key": key, "deleted": ok})
 
 
 # ============================================================
 # 全局错误兜底
 # ============================================================
+@app.errorhandler(HTTPException)
+def _on_http_exception(e: HTTPException):
+    """
+    404 / 405 / 413 这类标准 HTTP 错误按原状态码返回。
+
+    原来只注册了 Exception，Flask 会连 HTTPException 一起交给它，
+    结果 404 也被返回成 500 —— 探活、监控、agent 的重试逻辑全被带偏。
+    """
+    logger.warning("http error %s: %s %s", e.code, request.method, request.path)
+    return jsonify({"ok": False, "error": e.description}), e.code
+
+
 @app.errorhandler(Exception)
 def _on_exception(e: Exception):
     # 完整 traceback 写日志，HTTP 响应里不返内部细节（表名/路径/SQL）。
@@ -214,12 +240,18 @@ def _on_exception(e: Exception):
 
 
 def main() -> None:
-    """Flask 内置开发服务器。生产建议：gunicorn typecho_agent_api.server:app -w 2 -b 0.0.0.0:8000"""
+    """Flask 内置开发服务器，仅限本地调试。生产请用 gunicorn run:app"""
+    if CONFIG.http_debug:
+        logger.warning(
+            "HTTP_DEBUG=true —— Werkzeug 调试器会在出错时暴露交互式控制台（等同 RCE），"
+            "产线上务必关掉"
+        )
     app.run(
         host=CONFIG.http_host,
         port=CONFIG.http_port,
         debug=CONFIG.http_debug,
         use_reloader=CONFIG.http_debug,
+        threaded=True,
     )
 
 

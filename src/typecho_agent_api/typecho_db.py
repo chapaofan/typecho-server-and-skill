@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pymysql
-from dbutils.pooled_db import PooledDB
+from dbutils.pooled_db import PooledDB, TooManyConnections
 
 from .config import CONFIG
 
@@ -28,6 +28,13 @@ logger = logging.getLogger(__name__)
 
 # 全局连接池
 _POOL: Optional[PooledDB] = None
+
+# 这些异常出现时 DBUtils 会自动丢弃坏连接并重连重试
+_DB_FAILURES = (
+    pymysql.OperationalError,
+    pymysql.InterfaceError,
+    pymysql.InternalError,
+)
 
 
 def get_pool() -> PooledDB:
@@ -38,8 +45,14 @@ def get_pool() -> PooledDB:
             creator=pymysql,
             mincached=1,
             maxcached=5,
-            maxconnections=10,
-            blocking=True,
+            maxconnections=max(1, cfg.pool_max_connections),
+            # 不用 blocking=True：那是**无限等待**，一旦有连接没归还，
+            # 所有工作线程都会卡在这里，服务表现成「假死」。
+            # 改成非阻塞 + 在 _borrow() 里自己实现带超时的等待。
+            blocking=False,
+            ping=1,            # 每次从池取出时 ping，自动绕开 MySQL wait_timeout 断连
+            failures=_DB_FAILURES,
+            reset=True,
             host=cfg.host,
             port=cfg.port,
             user=cfg.user,
@@ -47,21 +60,53 @@ def get_pool() -> PooledDB:
             database=cfg.database,
             charset=cfg.charset,
             autocommit=False,
+            # 没有这三个超时，MySQL 或网络一卡住线程就永久挂起
+            connect_timeout=cfg.connect_timeout,
+            read_timeout=cfg.read_timeout,
+            write_timeout=cfg.write_timeout,
             cursorclass=pymysql.cursors.DictCursor,
         )
         logger.info("MySQL pool initialized for %s@%s/%s", cfg.user, cfg.host, cfg.database)
     return _POOL
 
 
+def _borrow():
+    """从池中取连接，最多等 pool_wait_timeout 秒，超时直接报错而不是无限等。"""
+    deadline = time.monotonic() + max(0.0, CONFIG.typecho.pool_wait_timeout)
+    while True:
+        try:
+            return get_pool().connection()
+        except TooManyConnections:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "database connection pool exhausted "
+                    f"(max={CONFIG.typecho.pool_max_connections})"
+                ) from None
+            time.sleep(0.05)
+
+
 @contextmanager
-def get_conn():
-    """获取连接，with 退出时自动 commit/rollback。"""
-    conn = get_pool().connection()
+def get_conn(conn=None):
+    """
+    获取连接，with 退出时自动 commit/rollback。
+
+    传入已有的 conn 时（嵌套调用场景）会**复用**它：既不重复占连接，
+    也不在中间层提前 commit，让整个请求落在同一个事务里。
+    事务的提交/回滚仍然由最外层负责。
+    """
+    if conn is not None:
+        yield conn
+        return
+
+    conn = _borrow()
     try:
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 - 回滚失败也别盖掉原始异常
+            logger.exception("rollback failed")
         raise
     finally:
         conn.close()  # 实际是归还到池
@@ -119,8 +164,9 @@ def select_one(conn, table: str, where: str, where_args: Sequence[Any]) -> Optio
 
 
 def select_all(conn, table: str, where: str = "1=1", where_args: Sequence[Any] = (),
-               order_by: str = "", limit: int = 0, offset: int = 0) -> List[Dict[str, Any]]:
-    sql = f"SELECT * FROM {_q(table)} WHERE {where}"
+               order_by: str = "", limit: int = 0, offset: int = 0,
+               columns: str = "*") -> List[Dict[str, Any]]:
+    sql = f"SELECT {columns} FROM {_q(table)} WHERE {where}"
     if order_by:
         sql += f" ORDER BY {order_by}"
     if limit > 0:
@@ -128,6 +174,18 @@ def select_all(conn, table: str, where: str = "1=1", where_args: Sequence[Any] =
     with conn.cursor() as cur:
         cur.execute(sql, list(where_args))
         return list(cur.fetchall())
+
+
+def count(conn, table: str, where: str = "1=1", where_args: Sequence[Any] = ()) -> int:
+    """
+    COUNT(*)。分页一定要用这个，不要把整表读进内存再 len()——
+    typecho_contents.text 是 LONGTEXT，文章一多那会把内存打满。
+    """
+    sql = f"SELECT COUNT(*) AS n FROM {_q(table)} WHERE {where}"
+    with conn.cursor() as cur:
+        cur.execute(sql, list(where_args))
+        row = cur.fetchone()
+        return int(row["n"]) if row else 0
 
 
 def now_ts() -> int:

@@ -16,7 +16,7 @@ import io
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 from qcloud_cos import CosConfig, CosS3Client  # 来自 cos-python-sdk-v5
@@ -41,6 +41,14 @@ ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
 def _client() -> CosS3Client:
+    """
+    每次新建 client。
+
+    这里刻意不做全局单例：CosS3Client 内部是 requests.Session，
+    而 Session **不是线程安全的**；Flask/gunicorn 多线程 worker 下共用会串请求。
+    新建的代价只有一次 TCP/TLS 握手，真正要防的是下面这个 Timeout ——
+    SDK 默认不设超时，网络一抖这个线程就永久卡死，几个请求就能把所有线程耗光。
+    """
     cfg = CONFIG.cos
     if not cfg.secret_id or not cfg.secret_key or not cfg.bucket:
         raise RuntimeError("COS config is incomplete: SECRET_ID/SECRET_KEY/BUCKET required")
@@ -49,6 +57,7 @@ def _client() -> CosS3Client:
         SecretId=cfg.secret_id,
         SecretKey=cfg.secret_key,
         Scheme=cfg.scheme,
+        Timeout=cfg.timeout,
     )
     return CosS3Client(cos_cfg)
 
@@ -67,8 +76,16 @@ def _build_key(filename: str) -> str:
     # 把空格替换成下划线
     name = name.replace(" ", "_")
     # 中文/特殊字符保留即可，COS Key 支持 UTF-8
-    today = datetime.utcnow()
+    today = datetime.now(timezone.utc)   # utcnow() 在 Python 3.12+ 已弃用
     return f"{cfg.key_prefix}{today.strftime('%Y/%m')}/{uuid.uuid4().hex[:8]}__{name}"
+
+
+def _check_size(data_or_size) -> None:
+    """上传大小上限。不设的话一个几百 MB 的请求就能把进程内存打满。"""
+    size = data_or_size if isinstance(data_or_size, int) else len(data_or_size)
+    limit = CONFIG.max_upload_bytes
+    if size > limit:
+        raise ValueError(f"file too large: {size} bytes > limit {limit} bytes")
 
 
 def _public_url(key: str) -> str:
@@ -102,6 +119,7 @@ def upload_file(local_path: str, key: Optional[str] = None) -> dict:
         )
     if not os.path.isfile(local_path):
         raise FileNotFoundError(local_path)
+    _check_size(os.path.getsize(local_path))
     final_key = key or _build_key(os.path.basename(local_path))
     content_type = _detect_content_type(final_key)
     logger.info("COS upload: local=%s key=%s ct=%s", local_path, final_key, content_type)
@@ -132,6 +150,7 @@ def upload_bytes(data: bytes, filename: str, content_type: Optional[str] = None,
         if ext not in ALLOWED_IMAGE_EXT:
             raise ValueError(f"image_only=True but extension {ext} is not allowed. "
                              f"Allowed: {sorted(ALLOWED_IMAGE_EXT)}")
+    _check_size(data)
     final_key = _build_key(filename)
     ct = content_type or _detect_content_type(final_key)
     response = _client().put_object(
@@ -171,6 +190,15 @@ def upload_base64(b64: str, filename: str = "image.png",
 
 
 def delete(key: str) -> bool:
+    """
+    删除 COS 对象。
+
+    只允许删 COS_KEY_PREFIX 前缀下的 key —— 否则一个带 API Key 的调用方
+    就能顺着这个接口把整个桶清空（包括跟博客无关的东西）。
+    """
+    prefix = CONFIG.cos.key_prefix
+    if prefix and not key.startswith(prefix):
+        raise ValueError(f"refuse to delete object outside COS_KEY_PREFIX: {key!r}")
     try:
         _client().delete_object(Bucket=CONFIG.cos.bucket, Key=key)
         return True

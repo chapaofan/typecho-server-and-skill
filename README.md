@@ -16,14 +16,54 @@ pip install -r requirements.txt
 cp .env.example .env
 vim .env   # 必改：TYPECHO_DB_* / COS_* / API_KEYS
 
-# 3) 启动
+# 3) 启动（仅本地调试）
 python run.py
-# → Uvicorn?  不对，是 Flask 自带 dev 服务器，输出会显示:
+# → Flask 自带开发服务器，输出会显示:
 #   * Running on http://0.0.0.0:8000
 ```
 
-宝塔部署：框架=python，启动方式=python，运行文件=`run.py`，端口=`.env` 里的 `HTTP_PORT`（默认 8000）。
-生产环境推荐 `gunicorn -w 2 -b 0.0.0.0:8000 run:app`。
+### 生产部署
+
+**不要用 `python run.py` 跑生产。** Flask 自带服务器没有守护、没有超时、没有 worker 管理，
+进程崩了不会自己起来，这也是「服务跑着跑着就挂了」最常见的直接原因。用 gunicorn：
+
+```bash
+pip install gunicorn
+gunicorn -w 2 -k gthread --threads 4 \
+         --timeout 30 --graceful-timeout 30 \
+         -b 127.0.0.1:8000 run:app
+```
+
+再交给进程管理器兜底（下面两个选一个）：
+
+```ini
+# supervisor:/etc/supervisor/conf.d/typecho-api.conf
+[program:typecho-api]
+command=/path/to/venv/bin/gunicorn -w 2 -k gthread --threads 4 --timeout 30 -b 127.0.0.1:8000 run:app
+directory=/path/to/typecho-server-and-skill
+autostart=true
+autorestart=true          ; ← 挂了自动拉起
+startretries=3
+stopasgroup=true
+stdout_logfile=/var/log/typecho-api.out.log
+stderr_logfile=/var/log/typecho-api.err.log
+```
+
+```ini
+# systemd:/etc/systemd/system/typecho-api.service
+[Service]
+WorkingDirectory=/path/to/typecho-server-and-skill
+ExecStart=/path/to/venv/bin/gunicorn -w 2 -k gthread --threads 4 --timeout 30 -b 127.0.0.1:8000 run:app
+Restart=always            ; ← 挂了自动拉起
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+```
+
+对外只暴露 443，用 Nginx 反代到 `127.0.0.1:8000`（服务本身不要直接监听 0.0.0.0）。
+
+宝塔部署：Python 项目 → 启动方式选 **gunicorn**，入口 `run:app`，端口用 `.env` 里的 `HTTP_PORT`（默认 8000）；
+并确认开启「进程守护 / 崩溃自动重启」。详见下面的 [生产部署](#生产部署)。
 
 ---
 

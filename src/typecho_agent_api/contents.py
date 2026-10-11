@@ -33,12 +33,14 @@ from pydantic import BaseModel, Field, field_validator
 
 from .config import CONFIG
 from .metas import (
+    _slugify,
     get_post_categories,
     get_post_tags,
     set_post_categories,
     set_post_tags,
 )
 from .typecho_db import (
+    count,
     delete,
     get_conn,
     insert,
@@ -147,14 +149,31 @@ def _visibility_to_status(visibility: str, password: Optional[str]) -> tuple[str
     return visibility, ""
 
 
-def _build_content_row(p: PostCreate) -> Dict[str, Any]:
+def _make_slug(conn, p: PostCreate) -> str:
+    """
+    确定 slug：没传就按标题生成，重名则补 -2/-3 后缀。
+
+    （原来这里直接写空串，和「留空自动生成」的说明对不上，
+    前台会拿到一堆 slug 为空、只能靠 cid 访问的文章。）
+    """
+    if p.slug:
+        return p.slug
+    base = _slugify(p.title) or f"post-{now_ts()}"
+    slug, i = base, 2
+    while select_one(conn, "contents", "slug=%s AND type='post'", (slug,)):
+        slug = f"{base}-{i}"
+        i += 1
+    return slug
+
+
+def _build_content_row(p: PostCreate, slug: str) -> Dict[str, Any]:
     status, password = _visibility_to_status(p.status, p.password)
     text = p.content
     if p.markdown:
         text = "<!--markdown-->" + text
     return {
         "title": p.title,
-        "slug": p.slug or "",
+        "slug": slug,
         "created": p.created_at if p.created_at is not None else now_ts(),
         "modified": now_ts(),
         "text": text,
@@ -210,15 +229,15 @@ def _apply_fields(conn, cid: int, fields: Dict[str, Union[str, int, float]]) -> 
             insert(conn, "fields", rows)
 
 
-def _select_post(cid: int) -> Optional[Dict[str, Any]]:
-    with get_conn() as conn:
-        row = select_one(conn, "contents", "cid=%s AND type='post'", (cid,))
+def _select_post(cid: int, conn=None) -> Optional[Dict[str, Any]]:
+    with get_conn(conn) as c:
+        row = select_one(c, "contents", "cid=%s AND type='post'", (cid,))
         if not row:
             return None
-        row["categories"] = get_post_categories(cid)
-        row["tags"] = get_post_tags(cid)
+        row["categories"] = get_post_categories(cid, conn=c)
+        row["tags"] = get_post_tags(cid, conn=c)
         # 自定义字段
-        fields = select_all(conn, "fields", "cid=%s", (cid,))
+        fields = select_all(c, "fields", "cid=%s", (cid,))
         row["custom_fields"] = {f["name"]: f for f in fields}
         return row
 
@@ -228,17 +247,20 @@ def _select_post(cid: int) -> Optional[Dict[str, Any]]:
 
 def create_post(p: PostCreate) -> Dict[str, Any]:
     """新增一篇文章，返回包含 cid 的字典。"""
-    row = _build_content_row(p)
+    # 整篇文章（主表 + 分类 + 标签 + 自定义字段）走同一个连接、同一个事务：
+    # 原来每一段各开一个连接各自提交，中途失败会留下「文章建了但没分类」的脏数据，
+    # 而且一次请求要占 3 个连接，并发稍高就把池子吃光。
     with get_conn() as conn:
-        cid = insert(conn, "contents", row)
+        slug = _make_slug(conn, p)
+        cid = insert(conn, "contents", _build_content_row(p, slug))
         # 分类
         if not p.category_ids:
             p.category_ids = [CONFIG.typecho.default_category_id]
         if p.category_ids:
-            set_post_categories(cid, p.category_ids)
+            set_post_categories(cid, p.category_ids, conn=conn)
         # 标签
         if p.tags:
-            set_post_tags(cid, p.tags)
+            set_post_tags(cid, p.tags, conn=conn)
         # 自定义字段
         if p.fields:
             _apply_fields(conn, cid, p.fields)
@@ -284,9 +306,9 @@ def update_post(cid: int, p: PostUpdate) -> Dict[str, Any]:
 
         if p.category_ids is not None:
             ids = p.category_ids if p.category_ids else [CONFIG.typecho.default_category_id]
-            set_post_categories(cid, ids)
+            set_post_categories(cid, ids, conn=conn)
         if p.tags is not None:
-            set_post_tags(cid, p.tags)
+            set_post_tags(cid, p.tags, conn=conn)
         if p.fields is not None:
             _apply_fields(conn, cid, p.fields)
     return get_post(cid)
@@ -329,9 +351,10 @@ def delete_post(cid: int) -> bool:
                 (cid,),
             )
 
-        # 草稿
+        # 草稿：Typecho 存的是 type='post_draft'（不是 'revision'），
+        # 写错的话草稿永远清不掉，会一直堆在 contents 表里。
         draft = select_one(conn, "contents",
-                           "parent=%s AND type='revision'", (cid,))
+                           "parent=%s AND type='post_draft'", (cid,))
         if draft:
             delete(conn, "contents", "cid=%s", (draft["cid"],))
             delete(conn, "fields", "cid=%s", (draft["cid"],))
@@ -371,16 +394,17 @@ def list_posts(
         where_parts.append("(title LIKE %s OR text LIKE %s)")
         args.extend([f"%{keyword}%", f"%{keyword}%"])
     where = " AND ".join(where_parts)
+    # 只取列表要用的列：text 是 LONGTEXT，SELECT * 会把每篇正文都拉回来。
+    list_cols = "cid,title,slug,status,type,created,modified,authorId,commentsNum"
     with get_conn() as conn:
-        rows = select_all(conn, "contents", where, args,
+        total = count(conn, "contents", where, args)
+        rows = select_all(conn, "contents", where, args, columns=list_cols,
                           order_by=order_by, limit=page_size,
                           offset=(page - 1) * page_size)
-        # 单独跑一次 count(*) 效率更高，但 typecho 数据量小，先用 fetchAll 简化
-        total_rows = select_all(conn, "contents", where, args, order_by="cid")
         return {
             "page": page,
             "page_size": page_size,
-            "total": len(total_rows),
+            "total": total,
             "items": [_serialize_post_simple(r) for r in rows],
         }
 
@@ -390,8 +414,8 @@ def find_post_by_slug(slug: str) -> Optional[Dict[str, Any]]:
         row = select_one(conn, "contents", "slug=%s AND type='post'", (slug,))
         if not row:
             return None
-        row["categories"] = get_post_categories(row["cid"])
-        row["tags"] = get_post_tags(row["cid"])
+        row["categories"] = get_post_categories(row["cid"], conn=conn)
+        row["tags"] = get_post_tags(row["cid"], conn=conn)
         return _serialize_post(row)
 
 
