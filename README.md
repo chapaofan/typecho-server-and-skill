@@ -62,6 +62,81 @@ WantedBy=multi-user.target
 
 对外只暴露 443，用 Nginx 反代到 `127.0.0.1:8000`（服务本身不要直接监听 0.0.0.0）。
 
+### 宝塔面板部署
+
+> 宝塔 Python 项目管理器的虚拟环境在 `/www/server/pyporject_evn/<项目名>_venv`
+> （`pyporject` 是宝塔自己的拼写，没写错）。**依赖必须手动装进这个 venv** ——
+> 面板里填了 requirements.txt 也不保证会装，这是最常见的启动失败原因。
+
+**1. 放代码**
+
+```bash
+cd /www/wwwroot
+git clone https://github.com/chapaofan/typecho-server-and-skill.git
+cd typecho-server-and-skill
+cp .env.example .env && vim .env      # 必改 TYPECHO_DB_* / COS_* / API_KEYS
+```
+
+**2. 装依赖（关键）**
+
+```bash
+VENV=/www/server/pyporject_evn/typecho-api_venv/bin     # venv 名跟项目名一致
+$VENV/pip install -r requirements.txt
+$VENV/pip install -e .        # ← src 布局，漏了这步会 ModuleNotFoundError
+$VENV/pip install gunicorn
+```
+
+面板没自动建 venv 就自己建一个，再把上面路径换掉：
+`python3 -m venv /www/server/pyporject_evn/typecho-api_venv`
+
+**3. 面板里添加 Python 项目**
+
+| 字段 | 填什么 |
+|---|---|
+| 项目名称 | `typecho-api`（决定 venv 目录名） |
+| 项目路径 | `/www/wwwroot/typecho-server-and-skill` |
+| Python 版本 | 3.9 及以上 |
+| 启动方式 | **gunicorn**，不要选 python（那是 Flask 自带服务器，没有守护） |
+| 启动命令 | 老版本填入口 `run:app`；9.x 填完整命令 `gunicorn -c gunicorn.conf.py run:app` |
+| 端口 | `8000`，要和 `.env` 里的 `HTTP_PORT` 一致 |
+| 开机自启 | 打开 |
+
+**4. 让 .env 一定能被读到**
+
+宝塔的工作目录不总是项目根，最稳的做法是在项目配置里加一条环境变量：
+
+```
+ENV_FILE=/www/wwwroot/typecho-server-and-skill/.env
+```
+
+权限收紧一下：`chmod 600 .env && chown www:www .env`
+
+**5. Nginx 反代**
+
+面板通常会自动加。手动配的话记得补上传大小限制，否则超过 1MB 的图片会被
+Nginx 直接挡掉（返回 413，根本到不了应用）：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8000;
+    client_max_body_size 20m;      # ← 和 .env 里的 MAX_UPLOAD_MB 对齐
+    proxy_read_timeout 60s;
+}
+```
+
+**6. 验证**
+
+```bash
+curl http://127.0.0.1:8000/healthz                        # → {"status":"ok"}
+curl -H "X-API-Key: 你的key" http://127.0.0.1:8000/v1/tools
+```
+
+日志看面板项目里的「日志」按钮，或 `/www/wwwlogs/`。
+
+**排障**：起不来就手动跑一遍看报错 ——
+`cd /www/wwwroot/typecho-server-and-skill && /www/server/pyporject_evn/typecho-api_venv/bin/gunicorn -c gunicorn.conf.py run:app`
+常见的是 `ModuleNotFoundError`（漏了 `pip install -e .`）和数据库连不上（`.env` 没读到）。
+
 宝塔部署：Python 项目 → 启动方式选 **gunicorn**，入口 `run:app`，端口用 `.env` 里的 `HTTP_PORT`（默认 8000）；
 并确认开启「进程守护 / 崩溃自动重启」。详见下面的 [生产部署](#生产部署)。
 

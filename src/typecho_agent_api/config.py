@@ -3,21 +3,55 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
-# 项目根（src/typecho_agent_api/config.py 往上两级）
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_logger = logging.getLogger(__name__)
 
-# 显式指定 .env 路径。
-# 不能依赖 load_dotenv() 默认的向上查找：gunicorn / supervisor / 宝塔 启动时
-# 的工作目录不确定，一旦找错文件，API_KEYS 和数据库密码会是空值，
-# 表现为「服务还在跑但所有接口 503」，很难排查。
-load_dotenv(_PROJECT_ROOT / ".env", override=False)
+
+def _find_env_file() -> Optional[Path]:
+    """
+    定位 .env，按优先级依次尝试：
+
+    1. 环境变量 ENV_FILE 显式指定（最保险，宝塔里推荐直接设这个）
+    2. 源码布局（src/typecho_agent_api/config.py 往上两级 = 项目根）
+    3. 包被安装进 site-packages 时（pip install . 而非 -e .）再往上找
+    4. 当前工作目录
+
+    不能只靠 load_dotenv() 默认的向上查找：gunicorn / supervisor / 宝塔启动
+    时的工作目录不确定，一旦找错文件，API_KEYS 和数据库密码就是空的，
+    表现是「进程还在跑但所有接口 503」，非常难排查。
+    """
+    explicit = os.getenv("ENV_FILE")
+    if explicit:
+        return Path(explicit)
+
+    here = Path(__file__).resolve()
+    candidates = []
+    for up in (2, 3):
+        if len(here.parents) > up:
+            candidates.append(here.parents[up] / ".env")
+    candidates.append(Path.cwd() / ".env")
+
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+_ENV_FILE = _find_env_file()
+if _ENV_FILE:
+    load_dotenv(_ENV_FILE, override=False)
+else:
+    _logger.warning(
+        "no .env found (looked next to the package and in cwd). "
+        "Set ENV_FILE=/abs/path/.env if your .env lives elsewhere."
+    )
 
 
 def _get(name: str, default: str = "") -> str:
